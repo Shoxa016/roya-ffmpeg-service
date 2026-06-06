@@ -29,6 +29,48 @@ class StitchResponse(BaseModel):
     download_url: Optional[str] = None
 
 
+def sanitize_text(text: str) -> str:
+    """Sanitize text for FFmpeg drawtext filter — removes all problematic characters."""
+    if not text:
+        return ""
+    # Remove or replace characters that break FFmpeg drawtext
+    replacements = {
+        "'": "",        # single quotes crash drawtext
+        '"': "",        # double quotes
+        ":": "-",       # colons break filter syntax
+        "\\": "",       # backslashes
+        "[": "(",       # square brackets break filter graph
+        "]": ")",
+        "{": "(",       # curly braces
+        "}": ")",
+        "%": "pct",     # percent signs
+        "\n": " ",      # newlines
+        "\r": " ",      # carriage returns
+        "#": "",        # hashtags (keep for hashtag field we handle separately)
+        "=": "-",       # equals signs
+        ";": ",",       # semicolons
+        "<": "",
+        ">": "",
+        "|": "-",
+        "!": ".",       # exclamation marks can cause issues
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    # Strip leading/trailing whitespace and limit length
+    text = text.strip()[:120]
+    return text
+
+
+def sanitize_hashtags(text: str) -> str:
+    """Special sanitizer for hashtag text — keeps # but removes other bad chars."""
+    if not text:
+        return ""
+    text = text.replace("'", "").replace('"', "").replace(":", "").replace("\\", "")
+    text = text.replace("[", "").replace("]", "").replace("{", "").replace("}", "")
+    text = text.replace("\n", " ").replace("\r", " ").replace("=", "").replace(";", "")
+    return text.strip()[:100]
+
+
 def download_file(url: str, dest_path: str) -> bool:
     """Download a file from URL to local path."""
     try:
@@ -245,54 +287,60 @@ def stitch_single_with_overlay(req: StitchRequest):
 
         current_input = src
 
-        # Build a single complex filtergraph with all text at once
-        filters = []
-        if req.hook_text:
-            safe = req.hook_text.replace("'", "\\'").replace(":", "\\:")
-            filters.append(
-                f"drawtext=text='{safe}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=h*0.12:box=1:boxcolor=black@0.6:boxborderw=12:enable='between(t,0,10)'"
-            )
-        if req.body_text:
-            safe = req.body_text.replace("'", "\\'").replace(":", "\\:")
-            filters.append(
-                f"drawtext=text='{safe}':fontcolor=white:fontsize=38:x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=black@0.6:boxborderw=10:enable='between(t,10,25)'"
-            )
-        if req.challenge_text:
-            safe = req.challenge_text.replace("'", "\\'").replace(":", "\\:")
-            filters.append(
-                f"drawtext=text='{safe}':fontcolor=yellow:fontsize=38:x=(w-text_w)/2:y=h*0.78:box=1:boxcolor=black@0.6:boxborderw=10:enable='between(t,25,32)'"
-            )
-        if req.hashtag_text:
-            safe = req.hashtag_text.replace("'", "\\'").replace(":", "\\:")
-            filters.append(
-                f"drawtext=text='{safe}':fontcolor=white:fontsize=30:x=(w-text_w)/2:y=h*0.88:box=1:boxcolor=black@0.4:boxborderw=8:enable='between(t,25,32)'"
-            )
+        # Sanitize all text inputs to prevent FFmpeg filter crashes
+        hook    = sanitize_text(req.hook_text or "")
+        body    = sanitize_text(req.body_text or "")
+        challenge = sanitize_text(req.challenge_text or "")
+        hashtags  = sanitize_hashtags(req.hashtag_text or "")
 
-        vf = ",".join(filters) if filters else "null"
-
-        final_output = f"/tmp/roya_output_{job_id}.mp4"
-        cmd = [
+        # Step 1: Scale/pad to 9:16 first
+        scaled = f"{work_dir}/scaled.mp4"
+        scale_cmd = [
             "ffmpeg", "-y", "-i", current_input,
-            "-vf", f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[scaled];[scaled]{vf}",
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            final_output
+            scaled
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            # Fallback: try without complex filter
-            simple_cmd = [
+        r = subprocess.run(scale_cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Scale failed: {r.stderr[-300:]}")
+
+        current_input = scaled
+
+        # Step 2: Add text overlays one at a time (safer than complex filtergraph)
+        step = 0
+        text_layers = []
+        if hook:
+            text_layers.append((hook, "h*0.12", 52, "white", 0, 10))
+        if body:
+            text_layers.append((body, "h*0.72", 36, "white", 10, 25))
+        if challenge:
+            text_layers.append((challenge, "h*0.80", 34, "yellow", 25, 32))
+        if hashtags:
+            text_layers.append((hashtags, "h*0.90", 28, "white", 25, 32))
+
+        for (txt, y, fs, color, t_start, t_end) in text_layers:
+            out_step = f"{work_dir}/step_{step}.mp4"
+            draw_cmd = [
                 "ffmpeg", "-y", "-i", current_input,
-                "-vf", vf,
+                "-vf",
+                f"drawtext=text={txt}:fontcolor={color}:fontsize={fs}:x=(w-text_w)/2:y={y}:box=1:boxcolor=black@0.55:boxborderw=10:enable=between(t\\,{t_start}\\,{t_end})",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                final_output
+                "-c:a", "copy",
+                out_step
             ]
-            result2 = subprocess.run(simple_cmd, capture_output=True, text=True)
-            if result2.returncode != 0:
-                raise HTTPException(status_code=500, detail=f"FFmpeg failed: {result2.stderr[-500:]}")
+            r = subprocess.run(draw_cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"Text layer {step} failed (skipping): {r.stderr[-200:]}")
+                # Skip this text layer rather than failing entirely
+            else:
+                current_input = out_step
+            step += 1
+
+        final_output = f"/tmp/roya_output_{job_id}.mp4"
+        import shutil
+        shutil.copy(current_input, final_output)
 
         import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
