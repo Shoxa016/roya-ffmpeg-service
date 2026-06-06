@@ -293,13 +293,15 @@ def stitch_single_with_overlay(req: StitchRequest):
         challenge = sanitize_text(req.challenge_text or "")
         hashtags  = sanitize_hashtags(req.hashtag_text or "")
 
-        # Step 1: Scale/pad to 9:16 first
+        # Step 1: Downscale to 540x960 for processing (saves ~75% memory)
+        # We upscale back to 1080x1920 at the very end
         scaled = f"{work_dir}/scaled.mp4"
         scale_cmd = [
             "ffmpeg", "-y", "-i", current_input,
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
+            "-vf", "scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:color=black",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "64k",
+            "-threads", "1",
             scaled
         ]
         r = subprocess.run(scale_cmd, capture_output=True, text=True)
@@ -308,39 +310,59 @@ def stitch_single_with_overlay(req: StitchRequest):
 
         current_input = scaled
 
-        # Step 2: Add text overlays one at a time (safer than complex filtergraph)
-        step = 0
-        text_layers = []
+        # Step 2: Add all text overlays in a single FFmpeg pass (less memory than multiple passes)
+        text_filters = []
         if hook:
-            text_layers.append((hook, "h*0.12", 52, "white", 0, 10))
+            text_filters.append(
+                f"drawtext=text={hook}:fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h*0.12:box=1:boxcolor=black@0.55:boxborderw=6:enable=between(t\\,0\\,10)"
+            )
         if body:
-            text_layers.append((body, "h*0.72", 36, "white", 10, 25))
+            text_filters.append(
+                f"drawtext=text={body}:fontcolor=white:fontsize=20:x=(w-text_w)/2:y=h*0.72:box=1:boxcolor=black@0.55:boxborderw=5:enable=between(t\\,10\\,25)"
+            )
         if challenge:
-            text_layers.append((challenge, "h*0.80", 34, "yellow", 25, 32))
+            text_filters.append(
+                f"drawtext=text={challenge}:fontcolor=yellow:fontsize=18:x=(w-text_w)/2:y=h*0.82:box=1:boxcolor=black@0.55:boxborderw=5:enable=between(t\\,25\\,32)"
+            )
         if hashtags:
-            text_layers.append((hashtags, "h*0.90", 28, "white", 25, 32))
+            text_filters.append(
+                f"drawtext=text={hashtags}:fontcolor=white:fontsize=15:x=(w-text_w)/2:y=h*0.92:box=1:boxcolor=black@0.4:boxborderw=4:enable=between(t\\,25\\,32)"
+            )
 
-        for (txt, y, fs, color, t_start, t_end) in text_layers:
-            out_step = f"{work_dir}/step_{step}.mp4"
+        with_text = f"{work_dir}/with_text.mp4"
+        if text_filters:
+            vf = ",".join(text_filters)
             draw_cmd = [
                 "ffmpeg", "-y", "-i", current_input,
-                "-vf",
-                f"drawtext=text={txt}:fontcolor={color}:fontsize={fs}:x=(w-text_w)/2:y={y}:box=1:boxcolor=black@0.55:boxborderw=10:enable=between(t\\,{t_start}\\,{t_end})",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-c:a", "copy",
-                out_step
+                "-threads", "1",
+                with_text
             ]
             r = subprocess.run(draw_cmd, capture_output=True, text=True)
             if r.returncode != 0:
-                print(f"Text layer {step} failed (skipping): {r.stderr[-200:]}")
-                # Skip this text layer rather than failing entirely
-            else:
-                current_input = out_step
-            step += 1
+                print(f"Text overlay failed, using video without text: {r.stderr[-200:]}")
+                with_text = current_input
+        else:
+            with_text = current_input
 
+        # Step 3: Final upscale to 1080x1920 for YouTube
         final_output = f"/tmp/roya_output_{job_id}.mp4"
+        final_cmd = [
+            "ffmpeg", "-y", "-i", with_text,
+            "-vf", "scale=1080:1920",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-threads", "1",
+            final_output
+        ]
+        r = subprocess.run(final_cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Final encode failed: {r.stderr[-300:]}")
+
         import shutil
-        shutil.copy(current_input, final_output)
 
         import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
