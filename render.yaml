@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: roya-ffmpeg-service
+    runtime: docker
+    plan: free
+    envVars:
+      - key: API_KEY
+        value: roya-secret-2024
+    healthCheckPath: /health
+    autoDeploy: true
